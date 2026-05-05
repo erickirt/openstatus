@@ -1,4 +1,11 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from "bun:test";
 import { and, db, eq } from "@openstatus/db";
 import {
   auditLog,
@@ -31,11 +38,67 @@ async function connectRequest(
 }
 
 const TEST_PREFIX = "rpc-monitor-test";
+const FREE_PLAN_KEY = "2";
 let testHttpMonitorId: number;
 let testTcpMonitorId: number;
 let testDnsMonitorId: number;
 let testMonitorToDeleteId: number;
 let testMonitorWithStatusId: number;
+
+type TinybirdMockData = {
+  httpListBiweekly: unknown[];
+  httpGetBiweekly: unknown[];
+};
+
+type TinybirdMockCalls = {
+  httpListBiweekly: unknown[];
+  httpGetBiweekly: unknown[];
+};
+
+function getTinybirdMocks() {
+  return {
+    data: (
+      globalThis as typeof globalThis & {
+        __tinybirdMockData: TinybirdMockData;
+      }
+    ).__tinybirdMockData,
+    calls: (
+      globalThis as typeof globalThis & {
+        __tinybirdMockCalls: TinybirdMockCalls;
+      }
+    ).__tinybirdMockCalls,
+  };
+}
+
+function responseLog(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "log_1",
+    latency: 123,
+    statusCode: 503,
+    monitorId: String(testHttpMonitorId),
+    requestStatus: "error",
+    region: "iad",
+    cronTimestamp: 1777667323000,
+    trigger: "api",
+    timestamp: 1777667323740,
+    timing: {
+      dns: 1,
+      connect: 2,
+      tls: 3,
+      ttfb: 4,
+      transfer: 5,
+    },
+    ...overrides,
+  };
+}
+
+beforeEach(() => {
+  const { data, calls } = getTinybirdMocks();
+  data.httpListBiweekly = [];
+  data.httpGetBiweekly = [];
+  calls.httpListBiweekly = [];
+  calls.httpGetBiweekly = [];
+});
 
 beforeAll(async () => {
   // Clean up any existing test data
@@ -1601,8 +1664,6 @@ describe("MonitorService - Default Values", () => {
 
 describe("MonitorService - Limits", () => {
   // Workspace 2 has free plan with limited periodicity (10m, 30m, 1h) and max 6 regions
-  const FREE_PLAN_KEY = "2";
-
   test("returns error when periodicity is not allowed by plan", async () => {
     // Free plan only allows 10m, 30m, 1h - PERIODICITY_30S is not allowed
     const res = await connectRequest(
@@ -2396,5 +2457,213 @@ describe("MonitorService.GetMonitorSummary", () => {
     );
 
     expect(res.status).toBe(401);
+  });
+});
+
+describe("MonitorService.ListMonitorHTTPResponseLogs", () => {
+  test("returns paginated response logs for an HTTP monitor", async () => {
+    const { data: mockData, calls } = getTinybirdMocks();
+    mockData.httpListBiweekly = [
+      responseLog({ id: "log_1", statusCode: 200, requestStatus: "success" }),
+      responseLog({ id: "log_2", statusCode: 503, requestStatus: "error" }),
+      responseLog({ id: "log_3", statusCode: 200, requestStatus: "success" }),
+    ];
+
+    const res = await connectRequest(
+      "ListMonitorHTTPResponseLogs",
+      {
+        id: String(testHttpMonitorId),
+        limit: 2,
+        offset: 20,
+      },
+      { "x-openstatus-key": "1" },
+    );
+
+    expect(res.status).toBe(200);
+
+    const result = await res.json();
+    expect(result.logs).toHaveLength(2);
+    expect(result.logs[0]).toMatchObject({
+      id: "log_1",
+      statusCode: 200,
+      monitorId: String(testHttpMonitorId),
+      requestStatus: "HTTP_RESPONSE_LOG_REQUEST_STATUS_SUCCESS",
+      region: "REGION_FLY_IAD",
+      trigger: "HTTP_RESPONSE_LOG_TRIGGER_API",
+      timestamp: "1777667323740",
+      timing: { dns: 1, connect: 2, tls: 3, ttfb: 4, transfer: 5 },
+    });
+    expect(result.pagination.limit).toBe(2);
+    expect(result.pagination.offset).toBe(20);
+    expect(result.pagination.hasMore).toBe(true);
+    expect(result.pagination.nextOffset).toBe(22);
+    expect(calls.httpListBiweekly).toEqual([
+      {
+        monitorId: String(testHttpMonitorId),
+        fromDate: undefined,
+        toDate: undefined,
+        limit: 3,
+        offset: 20,
+      },
+    ]);
+  });
+
+  test("returns not found for a monitor in another workspace", async () => {
+    const { calls } = getTinybirdMocks();
+    const otherWorkspaceMon = await db
+      .insert(monitor)
+      .values({
+        workspaceId: 2,
+        name: `${TEST_PREFIX}-response-logs-other-ws`,
+        url: "https://other-ws-response-logs.example.com",
+        periodicity: "1m",
+        active: true,
+        regions: "ams",
+        jobType: "http",
+      })
+      .returning()
+      .get();
+
+    try {
+      const res = await connectRequest(
+        "ListMonitorHTTPResponseLogs",
+        { id: String(otherWorkspaceMon.id) },
+        { "x-openstatus-key": "1" },
+      );
+
+      expect(res.status).toBe(404);
+      expect(calls.httpListBiweekly).toEqual([]);
+    } finally {
+      await db.delete(monitor).where(eq(monitor.id, otherWorkspaceMon.id));
+    }
+  });
+
+  test("requires the response logs entitlement", async () => {
+    const { calls } = getTinybirdMocks();
+    const res = await connectRequest(
+      "ListMonitorHTTPResponseLogs",
+      { id: String(testHttpMonitorId) },
+      { "x-openstatus-key": FREE_PLAN_KEY },
+    );
+
+    expect(res.status).toBe(403);
+    expect(calls.httpListBiweekly).toEqual([]);
+  });
+
+  test("rejects non-HTTP monitors", async () => {
+    const res = await connectRequest(
+      "ListMonitorHTTPResponseLogs",
+      { id: String(testTcpMonitorId) },
+      { "x-openstatus-key": "1" },
+    );
+
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("MonitorService.GetMonitorHTTPResponseLog", () => {
+  test("returns response log details without exposing the response body", async () => {
+    const { data } = getTinybirdMocks();
+    data.httpGetBiweekly = [
+      responseLog({
+        id: "log_error",
+        url: "https://example.com/fail",
+        error: true,
+        message: "status assertion failed",
+        headers: {
+          "Content-Type": "text/plain",
+          "X-Trace-Id": "trace_123",
+          Authorization: "Bearer secret",
+          "X-Session-Id": "session_123",
+        },
+        assertions: '[{"type":"status","compare":"eq","target":200}]',
+        body: "sensitive body",
+      }),
+    ];
+
+    const res = await connectRequest(
+      "GetMonitorHTTPResponseLog",
+      { id: String(testHttpMonitorId), logId: "log_error" },
+      { "x-openstatus-key": "1" },
+    );
+
+    expect(res.status).toBe(200);
+
+    const result = await res.json();
+    expect(result.log).toMatchObject({
+      url: "https://example.com/fail",
+      error: true,
+      message: "status assertion failed",
+      headers: {
+        "Content-Type": "text/plain",
+        "X-Trace-Id": "trace_123",
+        Authorization: "[redacted]",
+        "X-Session-Id": "[redacted]",
+      },
+      assertions: '[{"type":"status","compare":"eq","target":200}]',
+    });
+    expect(result.log.body).toBeUndefined();
+  });
+
+  test("requires the response logs entitlement", async () => {
+    const { calls } = getTinybirdMocks();
+    const res = await connectRequest(
+      "GetMonitorHTTPResponseLog",
+      { id: String(testHttpMonitorId), logId: "log_error" },
+      { "x-openstatus-key": FREE_PLAN_KEY },
+    );
+
+    expect(res.status).toBe(403);
+    expect(calls.httpGetBiweekly).toEqual([]);
+  });
+
+  test("returns not found for a monitor in another workspace", async () => {
+    const { calls } = getTinybirdMocks();
+    const otherWorkspaceMon = await db
+      .insert(monitor)
+      .values({
+        workspaceId: 2,
+        name: `${TEST_PREFIX}-response-log-detail-other-ws`,
+        url: "https://other-ws-response-log-detail.example.com",
+        periodicity: "1m",
+        active: true,
+        regions: "ams",
+        jobType: "http",
+      })
+      .returning()
+      .get();
+
+    try {
+      const res = await connectRequest(
+        "GetMonitorHTTPResponseLog",
+        { id: String(otherWorkspaceMon.id), logId: "log_error" },
+        { "x-openstatus-key": "1" },
+      );
+
+      expect(res.status).toBe(404);
+      expect(calls.httpGetBiweekly).toEqual([]);
+    } finally {
+      await db.delete(monitor).where(eq(monitor.id, otherWorkspaceMon.id));
+    }
+  });
+
+  test("returns not found when the response log does not exist", async () => {
+    const res = await connectRequest(
+      "GetMonitorHTTPResponseLog",
+      { id: String(testHttpMonitorId), logId: "missing-log-id" },
+      { "x-openstatus-key": "1" },
+    );
+
+    expect(res.status).toBe(404);
+  });
+
+  test("requires a log id", async () => {
+    const res = await connectRequest(
+      "GetMonitorHTTPResponseLog",
+      { id: String(testHttpMonitorId) },
+      { "x-openstatus-key": "1" },
+    );
+
+    expect(res.status).toBe(400);
   });
 });
